@@ -1,0 +1,962 @@
+---
+title: "<span style='font-size: 16px; color: grey'> crisprQTL proof-of-concept experiment in T cells </span> <br> <span style='font-size: 36px'> Hit calling </span>"
+author: "Ximena Ibarra-Soria"
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+output:
+  html_document:
+    theme: paper
+    keep_md: true
+    fig_width: 5
+    fig_height: 5
+    fig_caption: yes
+    df_print: paged
+    code_folding: hide
+    toc: true
+    toc_depth: 4
+    toc_float: 
+      collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(scater)
+library(scran)
+library(metapod)
+library(dplyr)
+library(scales)
+library(ggplot2)
+library(ggpubr)
+library(RColorBrewer)
+library(inlmisc)
+library(biomaRt)
+
+dir <- paste0(getwd(), "/")
+
+th <- theme_bw() + theme(
+  axis.text.x = element_text(size=10), 
+  axis.title.x = element_text(size=12), 
+  axis.text.y = element_text(size=12), 
+  axis.title.y = element_text(size=12),
+  panel.grid.major = element_blank(), 
+  panel.grid.minor = element_blank(), 
+  axis.line = element_line(colour = "black"), 
+  panel.border = element_blank(), 
+  plot.title = element_text(face="bold", hjust = 0.5))
+
+colors <- c(as.character(GetColors(n=5, scheme="muted"))[seq(1,5,2)],
+            as.character(GetColors(n=5, scheme="pale"))[4:5])
+names(colors) <- c("ENH", "TSS", "LCR", "INTRON", "INTERGENIC")
+
+## plotting function
+plot_target_expr <- function(sce=NULL, gene=NULL, guides=NULL, nt_cells=NULL, target=NULL,
+                             per_guide=TRUE, ann=NULL, fdr_thr=0.05){
+  ## get cells with gRNAs in `guides`
+  cells.guides <- sapply(guides, function(x) names(which(counts(altExp(sce, 'gRNA_calls'))[x,])),
+                         simplify = FALSE)
+  cells.pos <- rep(guides, times=unlist(lapply(cells.guides, length)))
+  names(cells.pos) <- unname(do.call(c, cells.guides))
+  
+  ## get cells with NT controls
+  cells.neg <- nt_cells
+  
+  ## retrieve expression of `gene`
+  df <- data.frame(cell = union(names(cells.pos), cells.neg))
+  df$expr <- logcounts(sce)[gene, df$cell]
+  df$status = factor(ifelse(df$cell %in% names(cells.pos), "perturbed", "NT"),
+                     levels=c("perturbed", "NT")) ## if a cell has both a targeting and NT gRNA, consider perturbed
+  df <- cbind(df,
+              sapply(unique(cells.pos), function(x) df$cell %in% names(cells.pos[cells.pos==x])))
+  ## for targets with 2 or more gRNAs, account for possibly having more than one target gRNA per cell
+  if(ncol(df)>4){
+    df$guide <- ifelse(rowSums(df[,-c(1:3)])>1 , "multiple",
+                       ifelse(rowSums(df[,-c(1:3)])==0, "NT", "guide"))
+    df <- df[df$guide != "multiple",]
+    for(g in unique(cells.pos)){
+      df[df[,g]==TRUE & df$guide == "guide",]$guide <- g
+    }
+    df$guide <- factor(df$guide, levels=c(unique(cells.pos), "NT"))
+  }else{
+    df$guide <- ifelse(df[,4]==TRUE, colnames(df)[4], "NT")
+    df$guide <- factor(df$guide, levels=c(colnames(df)[4], "NT"))
+  }
+
+  ## plot
+  if(per_guide==TRUE){
+    p <- ggplot(df, aes(guide, expr)) +
+      geom_violin(aes(colour = status), lwd=1) +
+      geom_jitter(stat="identity",  aes(colour = status),
+                  position=position_jitter(0.1), 
+                  # size=1, alpha=0.05) +
+                  size=1, alpha=0.2) +
+      scale_color_manual(values = c("lightcoral", "grey")) +
+      geom_boxplot(width=0.1, colour="black", fill=NA) +
+      geom_hline(yintercept = median(df[df$status=="NT",]$expr), 
+                 colour="grey40", lty=2) +
+      xlab("") + ylab(expression('log'[2]*' expression')) +
+      ggtitle(label = gene, 
+              subtitle = paste("guides for:", target, "\n")) +
+      th + theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5),
+                 legend.position = "none")
+  }else{
+    p <- ggplot(df, aes(status, expr)) +
+      geom_violin(aes(colour = status), lwd=1) +
+      geom_jitter(stat="identity",  aes(colour = status),
+                  position=position_jitter(0.1), 
+                  # size=1, alpha=0.05) +
+                  size=1, alpha=0.2) +
+      scale_color_manual(values = c("lightcoral", "grey")) +
+      geom_boxplot(width=0.1, colour="black", fill=NA) +
+      geom_hline(yintercept = median(df[df$status=="NT",]$expr), 
+                 colour="grey40", lty=2) +
+      xlab("") + ylab(expression('log'[2]*' expression')) +
+      ggtitle(label = gene, 
+              subtitle = paste("guides for:", target, "\n")) +
+      th + theme(axis.text.x = element_text(angle=90, hjust=1),
+                 legend.position = "none")
+  }
+  if(per_guide==TRUE){
+    if(is.null(ann)){
+      p <- p + annotate("text", 
+                        x = 1:length(levels(as.factor(df$guide))),
+                        y = max(df$expr)+((max(df$expr)-min(df$expr))*0.1), 
+                        label = paste0(
+                          paste0("(", as.numeric(round(prop.table(table(df$guide, df$expr>0),1)*100,1)[,'TRUE']), ")"), "\n",
+                          as.numeric(table(df$guide))),
+                        size = 3, colour = "grey10")
+    }else{
+      p <- p + annotate("text", 
+                        x = 1:length(levels(as.factor(df$guide))),
+                        y = max(df$expr)+((max(df$expr)-min(df$expr))*0.2), 
+                        label = paste0(
+                          c(formatC(ann[setdiff(levels(as.factor(df$guide)),"NT")], 
+                                    format = "e", digits = 2), ""), "\n",
+                          paste0("(", as.numeric(round(prop.table(table(df$guide, df$expr>0),1)*100,1)[,'TRUE']), ")"), "\n",
+                          as.numeric(table(df$guide))),
+                        size = 3, 
+                        colour = c(ifelse(ann[setdiff(levels(as.factor(df$guide)),"NT")] < fdr_thr, 
+                                          "red", "grey10"), "grey10")) +
+        coord_cartesian(clip = "off")
+    }
+  }else{
+    if(is.null(ann)){
+      p <- p + annotate("text", 
+                        x = 1:length(levels(df$status)),
+                        y = max(df$expr)+((max(df$expr)-min(df$expr))*0.1), 
+                        label = paste0(
+                          paste0("(", as.numeric(round(prop.table(table(df$status, df$expr>0),1)*100,1)[,'TRUE']), ")"), "\n",
+                          as.numeric(table(df$status))),
+                        size = 3, colour = "grey10") 
+    }else{
+      p <- p + annotate("text", 
+                        x = 1:length(levels(df$status)),
+                        y = max(df$expr)+((max(df$expr)-min(df$expr))*0.2), 
+                        label = paste0(
+                          c(formatC(ann, format = "e", digits = 2),
+                            "NA"), 
+                          "\n",
+                          paste0("(", as.numeric(round(prop.table(table(df$status, df$expr>0),1)*100,1)[,'TRUE']), ")"), "\n",
+                          as.numeric(table(df$status))),
+                        size = 3, 
+                        colour = c(ifelse(ann < fdr_thr, "red", "grey10"), "grey10")) +
+        coord_cartesian(clip = "off")
+    }
+  }
+  return(p)
+}
+
+```
+
+We have compared four different approaches to detect differentially expressed genes in perturbed cells. All methods were good at detecting expected changes in expression for positive-control perturbations. However, all showed miscalibrated p-values, which is expected since we do not have biological replicates in these data. **`MAST` is our method of choice for this dataset since it showed the best trade-off between true and false positives.**
+
+```{r data}
+# data
+sce <- readRDS(paste0(dir, "results/03_sce_POC_Tcells.goodQual.calls.NORM.Rds"))
+# genes detected in at least 5% of the cells
+genes_to_keep <- rowSums(counts(sce)>0) > ncol(sce)*0.05
+genes_detected <- rownames(sce)[genes_to_keep]
+
+# gRNA annotation
+gRNA_ann <- read.table(paste0(dir, "data/gRNA_library.tsv"), sep="\t", header = TRUE)
+targets <- setdiff(gRNA_ann$target, "NT")
+
+# define NT cells for plotting
+nt_guides <- gRNA_ann[gRNA_ann$class=="NT",]$ID
+cells <- colnames(sce[,sce$call == "unique"])
+cells_neg <- apply(counts(altExp(sce, 'gRNA_calls'))[nt_guides, cells], 1, function(x) names(which(x)))
+cells_neg <- unlist(cells_neg)
+```
+
+### Target-level results
+
+In the previous script we observed p-values are inflated and thus we have a *large* fraction of false positives. We also observed that DE genes that are reproduced by several DE algorithms tend to be supported by independent gRNAs. Thus, the combined evidence from separate perturbations for the same target is a good approach to enrich for robust hits.
+
+We perform hit calling at the target level, taking into account the combined information from all 4 gRNAs from each target. The raw p-values for each gRNA are integrated into a single p-value using Fisher's method. We correct for multiple testing at the screen level, considering all tests performed for genes in the vicinity of their targets. 
+
+Considering all targets together, we recover  a little under 400 significant element-to-gene (E2G) pairs.
+
+```{r mast_degs_tgt}
+## MAST results
+mast <- read.table(paste0(dir, "results/05_DE_results.mast.tsv"), header=TRUE)
+mast$pair_tgt <- paste(mast$target, mast$gene_id, sep="|")
+
+## integrate results at target level for reproducible hits
+mast.tgt <- mast %>% 
+  group_by(pair_tgt) %>%
+  mutate(gRNAs = paste(gRNA_id, collapse=","),
+         p_values = paste(p_value, collapse=","),
+         logFCs = paste(logFC, collapse=","),
+         n_gRNAs = sum(p_value < 0.05),
+         n_down = sum(ifelse(is.na(logFC[p_value < 0.05] < 0), TRUE, logFC[p_value < 0.05] < 0)), # if all cells are 0 FC is NA (count as down)
+         n_up = sum(logFC[p_value < 0.05] > 0, na.rm=TRUE))
+mast.tgt$direction <- ifelse(mast.tgt$n_down > 0 & mast.tgt$n_up > 0, "discordant",
+                            ifelse(mast.tgt$n_down > 0, "down", ifelse(mast.tgt$n_up > 0, "up", NA)))
+
+## for a summary logFC, we take the mean across all gRNAs that have a significant effect
+mast.tgt <- mast.tgt %>% 
+  group_by(pair_tgt) %>% 
+  mutate(logFC_summary = mean(logFC[p_value < 0.05], na.rm=TRUE))
+
+## for a summary p-value, we integrate results across gRNAs using Fisher's method
+pvals.tgt <- combineGroupedPValues(p.values = mast$p_value, grouping = mast$pair_tgt, method="fisher")$p.value
+mast.tgt$pval_fisher <- pvals.tgt[match(mast.tgt$pair_tgt, names(pvals.tgt))]
+
+# keep relevant columns and uniquify
+mast.tgt <- as.data.frame(mast.tgt[,c("target","gene_id","pair_tgt", "class","expected_gene", "pval_fisher","logFC_summary", 
+                                      "n_gRNAs","n_down","n_up","direction", "gRNAs","p_values","logFCs")])
+mast.tgt <- unique(mast.tgt)
+# FDR correction
+mast.tgt$FDR <- p.adjust(mast.tgt$pval_fisher, method = 'fdr')
+mast.tgt <- mast.tgt[,c(1:6,15,7:14)]
+
+mast.sig <- mast.tgt[mast.tgt$FDR < 0.05,]
+c(total_DEGs = nrow(mast.sig))
+```
+
+The magnitude of the per-target adjusted p-value nicely reflects the amount of evidence provided by the independent gRNAs. 
+
+```{r fisher_pval_vs_n_grnas, fig.width=5, fig.height=3}
+ggplot(mast.sig, aes(as.factor(n_gRNAs), (FDR))) +
+  geom_violin(scale="width") +
+  geom_boxplot(width=0.1) +
+  xlab("number of gRNAs < 0.05 (raw gRNA-level p-values)") +
+  ylab("target-level FDR") +
+  th
+```
+
+### Differentially expressed genes
+
+The library contains 80 targets:
+
+```{r targets}
+table(unique(gRNA_ann[,c('target', 'class')])$class)[c(6,4,1,3,2)]
+```
+
+From these, only four have no DE genes within 1Mb. 
+
+```{r targts_no_hits}
+## targets with no hits
+no_degs <- setdiff(targets, mast.sig$target)
+no_degs
+```
+
+The gRNAs for these four targets are generally detected in fewer cells compared to the rest of the library. Thus, it is possible that some of these perturbations do induce expression changes but we are underpowered to detect them.
+
+```{r no_hits_ncells, fig.width=4, fig.hight=4}
+n_cells_per_gRNA <- as.data.frame(rowSums(counts(altExp(sce, 'gRNA_calls'))))
+colnames(n_cells_per_gRNA) <- "n_cells"
+n_cells_per_gRNA$target <- gRNA_ann[match(row.names(n_cells_per_gRNA), gRNA_ann$ID),'target']
+n_cells_per_gRNA$no_DEGs <- n_cells_per_gRNA$target %in% no_degs
+
+ggplot(n_cells_per_gRNA, aes(no_DEGs, n_cells)) +
+  scale_y_log10() +
+  annotation_logticks(side="l") +
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  ylab("number of cells per gRNA") +
+  xlab("zero DE genes detected within 1 Mb") +
+  th
+```
+
+Most perturbations result in a small number of DE genes within 1 Mb of the perturbation site, with a median of 4 DE genes.
+
+```{r n_DE}
+## number of hits per target
+n_DE_per_tgt <- as.data.frame(table(mast.sig$target))
+colnames(n_DE_per_tgt) <- c("target", "n_DE")
+n_DE_per_tgt$class <- gRNA_ann[match(n_DE_per_tgt$target, gRNA_ann$target),'class']
+n_DE_per_tgt$class <- factor(n_DE_per_tgt$class, levels=c("TSS", "LCR", "ENH", "INTRON", "INTERGENIC"))
+
+summary(n_DE_per_tgt$n_DE)
+```
+
+A large number of targets result in 1-2 DE genes only, and perturbing the `TSS` generally induces more changes than intergenic perturbations.
+
+```{r n_DE_plot, fig.width=7, fig.height=4}
+ggplot(n_DE_per_tgt, aes(n_DE, fill=class)) +
+  geom_bar() +
+  scale_fill_manual(values = colors) +
+  xlab("number of DE genes within 1Mb") +
+  ylab("number of targets") +
+  th
+```
+
+#### Tier classification
+
+We classify DE genes into confidence tiers based on the amount of support from independent gRNAs.
+
+- `low` tier E2G pairs: only **one** gRNA-level raw p-value < 0.05.
+- `medium` tier E2G pairs: **two** gRNA-level raw p-value < 0.05, **both in the same direction**.
+- `high` tier E2G pairs: **three or four** gRNA-level raw p-value < 0.05, **all in the same direction**.
+
+```{r tiers, fig.width=7, fig.height=4}
+## confidence tiers
+mast.sig$tier <- factor(ifelse(mast.sig$n_gRNAs == 1, "low",
+                               ifelse(mast.sig$n_up == 2 | mast.sig$n_down == 2, "medium", 
+                                       ifelse(mast.sig$n_up > 2 | mast.sig$n_down > 2, "high", "low"))), 
+                        levels=c("high","medium","low"))
+table(mast.sig$tier)
+```
+
+As highlighted above, 76 targets have at least one DE gene within 1Mb of the target site. Almost all of these (92%) have at least one `medium` hit, and the majority (72%) have at least one `high` hit. This indicates that the vast majority of perturbations result in a change in gene expression in *cis* that is detectable in the single-cell data.
+
+```{r targets_tier}
+c(any_tier = length(unique(mast.sig$target)),
+  at_least_medium = length(unique(mast.sig[mast.sig$tier!="low",]$target)),
+  at_least_1_high = length(unique(mast.sig[mast.sig$tier=="high",]$target)))
+```
+
+The hits in the `low` tier that are only identified with one gRNA are more likely to be off-target or false-positive effects. Many of these have small raw gRNA-level p-values, but also include gRNAs that are detected in much larger number of cells. Together, these data suggest that many are likely false positives that stem from increased statistical power due to large cell numbers. Thus, we discard these hits from downstream analyses.
+
+```{r low_tier, fig.width=8, fig.height=3}
+mast$tier <- mast.sig[match(mast$pair_tgt, mast.sig$pair_tgt),'tier']
+
+df <- mast[mast$p_value < 0.05 & !(is.na(mast$tier)),]
+df$n_cells <- rowSums(counts(altExp(sce, 'gRNA_calls')))[df$gRNA_id]
+
+plots <- list()
+plots[[1]] <- ggplot(df, aes(tier, p_value)) +
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  xlab("") +
+  ylab("raw gRNA-level p-value") +
+  th
+plots[[2]] <- ggplot(df, aes(tier, n_cells)) +
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  xlab("") +
+  ylab("number of cells per gRNA") +
+  th
+ggarrange(plotlist = plots)
+```
+
+Ignoring `low` tier hits, 88% of all targets have 5 or fewer DE genes in the vicinity of the perturbation site, and nearly half (33 out of 70, 47%) result in only one or two DE genes.
+
+- The proportion of targets with only 1/2 hits is twice as high for intergenic (59%) compared to `TSS` perturbations (36%). This might be related to the smaller changes in expression induced by intergenic perturbations, which in turn lead to smaller downstream effects, compared to a `TSS` target that more closely resembles a KO.
+
+```{r n_DE_plot_no_low, fig.width=7, fig.height=4}
+## number of hits per target
+n_DE_per_tgt <- as.data.frame(table(mast.sig[mast.sig$tier!="low",]$target))
+colnames(n_DE_per_tgt) <- c("target", "n_DE")
+n_DE_per_tgt$class <- gRNA_ann[match(n_DE_per_tgt$target, gRNA_ann$target),'class']
+n_DE_per_tgt$class <- factor(n_DE_per_tgt$class, levels=c("TSS", "LCR", "ENH", "INTRON", "INTERGENIC"))
+
+summary(n_DE_per_tgt$n_DE)
+
+ggplot(n_DE_per_tgt, aes(n_DE, fill=class)) +
+  geom_bar() +
+  scale_fill_manual(values = colors) +
+  xlab("number of DE genes within 1Mb") +
+  ylab("number of targets") +
+  th
+```
+
+```{r n_DE_plot_tier, fig.width=10, fig.height=4}
+plots <- list()
+
+n_DE_per_tgt <- as.data.frame(table(mast.sig[mast.sig$tier=="high",]$target))
+colnames(n_DE_per_tgt) <- c("target", "n_DE")
+n_DE_per_tgt$class <- gRNA_ann[match(n_DE_per_tgt$target, gRNA_ann$target),'class']
+n_DE_per_tgt$class <- factor(n_DE_per_tgt$class, levels=c("TSS", "LCR", "ENH", "INTRON", "INTERGENIC"))
+plots[[1]] <- ggplot(n_DE_per_tgt, aes(n_DE, fill=class)) +
+  geom_bar() +
+  scale_fill_manual(values = colors) +
+  xlim(c(0,13)) +
+  ggtitle("high-confidence hits") +
+  xlab("number of DE genes within 1Mb") +
+  ylab("number of targets") +
+  th
+
+n_DE_per_tgt <- as.data.frame(table(mast.sig[mast.sig$tier=="medium",]$target))
+colnames(n_DE_per_tgt) <- c("target", "n_DE")
+n_DE_per_tgt$class <- gRNA_ann[match(n_DE_per_tgt$target, gRNA_ann$target),'class']
+n_DE_per_tgt$class <- factor(n_DE_per_tgt$class, levels=c("TSS", "LCR", "ENH", "INTRON", "INTERGENIC"))
+plots[[2]] <- ggplot(n_DE_per_tgt, aes(n_DE, fill=class)) +
+  geom_bar() +
+  scale_fill_manual(values = colors) +
+  xlim(c(0,13)) +
+  ggtitle("medium-confidence hits") +
+  xlab("number of DE genes within 1Mb") +
+  ylab("number of targets") +
+  th
+ggarrange(plotlist = plots, common.legend = TRUE, legend = "right")
+```
+
+#### Expected genes for positive control perturbations
+
+As discussed previously and consistent with results at the gRNA level, positive control perturbations result in differential expression of the expected gene most of the time:
+
+- 94% for `TSS` targets.
+- 100% for `LCR` targets.
+- 73% for `ENH` targets.
+
+```{r tp}
+pos.ctrls <- mast.sig[!is.na(mast.sig$expected_gene),]
+
+df <- as.data.frame(table(unique(pos.ctrls[,c('target','class')])$class))
+colnames(df) <- c("class", "n_targets")
+df$n_expected_DE <- as.data.frame(table(pos.ctrls[pos.ctrls$expected_gene==pos.ctrls$gene_id,]$class))$Freq
+df
+```
+
+Only 4 of the targets have `low` confidence effects.
+
+```{r tp_tier}
+table(pos.ctrls[pos.ctrls$expected_gene==pos.ctrls$gene_id,]$class,
+      pos.ctrls[pos.ctrls$expected_gene==pos.ctrls$gene_id,]$tier)
+```
+
+And almost all the changes correspond to downregulation effects, as expected.
+
+```{r tp_down}
+table(pos.ctrls[pos.ctrls$expected_gene==pos.ctrls$gene_id,]$class,
+      pos.ctrls[pos.ctrls$expected_gene==pos.ctrls$gene_id,]$direction)
+```
+
+
+### Limitations on perturbation effect detection
+
+Gene expression levels are one of the key limitations of single-cell technologies, and this greatly impacts our ability to detect perturbation effects. 
+
+- We only tested genes that are detected in at least 5% of the cells in the dataset (~10K genes), corresponding to the top third from all genes detected in the experiment. 
+- `TSS` controls were selected to span different expression levels. When tested, all but one result in significant differential expression suggesting strong effects can be detected effectively as long as the gene can be profiled by single-cell techniques.
+- Instead, perturbation of intergenic `regulatory elements` result in significant differential expression in a more limited range of higher expression levels (top 6K genes). Enhancers regulating genes expressed at lower levels do not produce detectable expression changes, likely because the effects are much smaller. Increased power for these events will require larger numbers of cells and/or targeted transcriptomic approaches.
+  + A few expected genes expressed at high levels are not detected as DE genes. Three out of four correspond to `ENH` elements and thus likely correspond to enhancers that are not functional in T cells. 
+
+```{r mean_rank_expr, fig.width=8, fig.height=3}
+## mean expr
+means <- rowMeans(logcounts(sce))
+mast.sig$mean <- means[mast.sig$gene_id]
+
+## expression ranks
+ranks <- means[order(means, decreasing = TRUE)]
+ranks <- data.frame(mean=ranks,
+                    rank=1:length(ranks))
+ranks$detected <- row.names(ranks) %in% genes_detected
+
+## annotate perturbation status
+ranks$perturbed <- row.names(ranks) %in% gRNA_ann$expected_DE_gene
+# flag which are detected
+ranks$sig <- row.names(ranks) %in% mast.sig$gene_id
+ranks$class <- gRNA_ann[match(row.names(ranks), gRNA_ann$expected_DE_gene),]$class
+
+## plot all genes in a line
+ranks$dummy <- 1
+## separate significant genes
+ranks[ranks$sig,]$dummy <- 2
+## separate genes targeted
+ranks[ranks$perturbed,]$dummy <- 6
+## separate significant
+ranks[which(ranks$sig & ranks$class != "TSS"),]$dummy <- 4
+ranks[which(ranks$sig & ranks$class == "TSS"),]$dummy <- 5
+
+## set colors
+ranks$status <- ifelse(ranks$sig & ranks$perturbed, "targeted + DE",
+                    ifelse(ranks$sig, "non-targeted + DE",
+                           ifelse(ranks$perturbed, "targeted + non-DE", 
+                                  ifelse(ranks$detected, "tested", "not-tested"))))
+ranks$group <- "not-targeted"
+ranks[which(ranks$class == "TSS"),]$group <- "TSS"
+ranks[which(ranks$class != "TSS"),]$group <- "INTERGENIC"
+ranks$group <- factor(ranks$group, levels=c('not-targeted', 'TSS', 'INTERGENIC'))
+
+ggplot(ranks, aes(rank, dummy, shape=group, colour=status)) +
+  geom_point(size=2) +
+  scale_color_manual(values = c('tested'='grey50', 'not-tested'='grey80', 'non-targeted + DE'='indianred2', 
+                                'targeted + DE'='indianred3', 'targeted + non-DE'='pink2')) +
+  ylim(0,7) +
+  ylab("") +
+  guides(color=guide_legend(nrow=3, byrow=TRUE),
+         shape=guide_legend(nrow=3, byrow=TRUE)) +
+  labs(colour="", shape = "") +
+  th + theme(axis.text.x = element_blank(),
+             axis.text.y = element_blank(),
+             axis.ticks.y = element_blank(),
+             legend.position = "bottom")
+```
+
+- As expected, perturbations supported by higher number of independent gRNAs correspond to genes expressed at higher levels, which are easier to detect. Plot below shows only tested genes, split by the number of gRNAs with a raw gRNA p-value < 0.05.
+
+```{r mean_rank_expr_detected, fig.width=8, fig.height=4}
+max_support <- mast.sig %>% 
+  group_by(gene_id) %>% 
+  summarise(n_grna = max(n_gRNAs))
+ranks$n_grna <- max_support[match(row.names(ranks), max_support$gene_id),]$n_grna
+ranks[is.na(ranks$n_grna),]$n_grna <- 0
+
+df <- ranks[ranks$detected,]
+df <- df[order(df$n_grna),]
+
+df$dummy <- 2
+df[which(df$class != "TSS"),]$dummy <- 4
+df[which(df$class == "TSS"),]$dummy <- 5
+
+plots <- list()
+plots[[1]] <- ggplot(df, aes(rank, dummy, shape=group, colour=as.factor(n_grna))) +
+  geom_point(size=2) +
+  scale_color_manual(values = c('grey60',GetColors(n=11, scheme = "sunset")[c(6,8,10,11)]),
+                     guide="none") +
+  xlab("") +
+  ylab("") +
+  ylim(1,6) +
+  facet_wrap(~n_grna, ncol=5) +
+  labs(shape = "") +
+  th + theme(axis.text.x = element_blank(),
+             axis.text.y = element_blank(),
+             axis.ticks.y = element_blank(),
+             strip.background = element_rect(fill=NA, size=1),
+             strip.text = element_text(size=10, face="bold"),
+             panel.border = element_rect(fill=NA),
+             legend.position = "top")
+plots[[2]] <- ggplot(df, aes(rank, colour=as.factor(n_grna))) +
+  geom_density() +
+  scale_color_manual(values = c('grey60',GetColors(n=11, scheme = "sunset")[c(6,8,10,11)])) +
+  facet_wrap(~n_grna, ncol=5) +
+  ylab("") +
+  th + theme(axis.text.x = element_blank(),
+             axis.text.y = element_blank(),
+             axis.ticks.y = element_blank(),
+             strip.background = element_blank(),
+             strip.text = element_blank(),
+             panel.border = element_rect(fill=NA),
+             legend.position = "none")
+ggarrange(plotlist = plots, ncol=1, heights = c(0.6,0.4))
+```
+
+Similarly, the magnitude of the perturbation effect has a strong influence on our detection power. Although fold-change estimates are unreliable when the amount of zeroes is large, we clearly observe that perturbations with larger fold-changes are more easily detected and have support by more gRNAs.
+
+```{r fold_change_abs, warning=FALSE, fig.width=5, fig.height=4}
+ggplot(mast.sig, aes(as.factor(n_gRNAs), abs(logFC_summary))) +
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  xlab("number of independent gRNAs with raw p-value < 0.05") +
+  ylab("absolute fold-change") +
+  th
+```
+
+The majority of the expected genes from positive control perturbations are downregulated (negative fold-changes); and the effect sizes are much larger when targeting the `TSS`, compared to `intergenic` regulatory elements. 
+
+```{r fold_change, warning=FALSE, fig.width=8, fig.height=4}
+mast.sig$expected <- mast.sig$gene_id == mast.sig$expected_gene
+ggplot(mast.sig[order(mast.sig$expected),], aes(as.factor(n_gRNAs), logFC_summary)) +
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  geom_jitter(stat="identity", aes(colour=expected),
+              position=position_jitter(0.1), size=1, alpha=0.5) +
+  scale_color_manual(values = c("grey80", "indianred2")) +
+  geom_hline(yintercept = 0, lwd=1, col="grey40", lty=2) +
+  facet_wrap(~ifelse(class=="TSS", "TSS", "intergenic")) +
+  xlab("number of gRNAs with raw p-value < 0.05") +
+  ylab("log2 fold-change") +
+  th + theme(strip.background = element_rect(fill=NA, size=1),
+             strip.text = element_text(size=10, face="bold"),
+             panel.border = element_rect(fill=NA))
+```
+
+### Gene-target distance
+
+We compute the distance for all significant E2G links. High-confidence pairs are generally close to the perturbation site (55% within 50kb; 46% within 25 kb). In contrast, low-confidence hits tend to span much longer distances, supporting some of these might be false positives.
+
+```{r distance, fig.width=8, fig.height=3}
+## annotate gene neighbourhood
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", version=98)
+
+## for each target, retrieve the genes in the neighbourhood
+## rank them by distance
+## annotate whether they are expressed
+distance <- 1e6
+gene_distance_target <- sapply(unique(mast.sig$target), function(t){
+  ## get coordinates of target
+  coords <- unique(gRNA_ann[gRNA_ann$target==t, c('chr','start','end')])
+  # remmove 'chr' prefix to match ensembl chr names
+  coords[1] <- substr(coords[1], 4,5)
+  
+  ## retreive nearby genes
+  genes <- getBM(attributes = c('external_gene_name','chromosome_name','start_position','end_position','strand'),
+                 filters = c('chromosome_name','start','end'),
+                 values = list(coords$chr, 
+                               coords$start-distance, 
+                               coords$end+distance),
+                 mart = ensembl)
+  genes$target <- t
+  
+  ## distance from target midpoint to gene _start_ (as proxy for TSS)
+  midpoint <- ceiling( coords$start+((coords$end-coords$start)/2))
+  genes$distance <- ifelse(genes$strand==1, abs(genes$start_position-midpoint), abs(genes$end_position-midpoint))
+                          
+  genes <- genes[order(genes$distance),]
+  genes$dist_rank <- 1:nrow(genes)
+  genes$expressed <- genes_to_keep[genes$external_gene_name]  ## FALSE for those in less than 5%; NA for non-detected
+  return(genes)
+}, simplify = FALSE)
+gene_distance_target <- do.call(rbind, gene_distance_target)
+gene_distance_target$pair_tgt <- paste(gene_distance_target$target, gene_distance_target$external_gene_name, sep="|")
+gene_distance_target$DE <- gene_distance_target$pair_tgt %in% mast.sig$pair_tgt
+gene_distance_target$tier <- mast.sig[match(gene_distance_target$pair_tgt, mast.sig$pair_tgt),]$tier
+
+## add distance to results
+mast.sig$distance <- gene_distance_target[match(mast.sig$pair_tgt, gene_distance_target$pair_tgt),]$distance
+
+ggplot(mast.sig, aes(distance/1e3, colour=tier)) +
+  geom_density(size=1) +
+  scale_color_manual(values = GetColors(n=11, scheme = "sunset")[c(10,8,6)]) +
+  facet_wrap(~ifelse(class=="TSS", "TSS", "intergenic"), scales="free_y") +
+  xlab("gene-target distance (kb)") +
+  th
+```
+
+For `intergenic` perturbations, we check how often the DE genes include the nearest **detected** gene (at least 5% of cells). 
+
+- Over two thirds (69%) of all intergenic perturbations include the nearest detected gene.
+
+```{r nearest_gene, fig.width=10, fig.height=4}
+## annotate number of _expressed_ genes that are nearer to the target compared to DE gene
+df <- gene_distance_target[gene_distance_target$DE,]
+df$nearer_expr <- sapply(1:nrow(df), function(i) 
+  sum(gene_distance_target[gene_distance_target$target == df$target[i] &
+                             gene_distance_target$dist_rank < df$dist_rank[i],]$expressed, na.rm = TRUE))
+df$nearer_expr_l <- df$nearer_expr == 0
+df$class <- gRNA_ann[match(df$target, gRNA_ann$target),]$class
+
+# add to results df
+mast.sig$nearest_expr <- df[match(mast.sig$pair_tgt, df$pair_tgt),'nearer_expr_l']
+
+tmp <- t(table(df[df$class != "TSS",]$target, df[df$class != "TSS",]$nearer_expr_l))
+tmp <- tmp[,order(colSums(tmp))]
+
+# plot
+tmp <- as.data.frame(tmp)
+tmp$class <- gRNA_ann[match(tmp$Var2, gRNA_ann$target),]$class
+ggplot(tmp, aes(Var2, Freq, fill=Var1)) +
+  geom_bar(stat="identity") +
+  scale_fill_manual(values = c("grey", "indianred2")) +
+  facet_grid(~class, scales = "free_x", space = "free_x") +
+  labs(fill = "is nearest detected") +
+  xlab("") +
+  ylab("# DE genes") +
+  th + theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+```
+
+- Almost all DE genes that are the nearest detected are `high` or `medium` confidence hits.
+
+```{r}
+round(prop.table(table(df[df$nearer_expr_l,]$tier))*100, 2)
+```
+
+- From `high` confidence hits, 40% are the nearest gene, compared to only 12% of `medium` and 6% of `low` hits.
+
+```{r}
+round(prop.table(table(df$tier, is_nearest=df$nearer_expr_l), 1)*100, 2)
+```
+
+Thus, robust detection of expression changes is more effective if the affected genes are close to the putative regulatory element, perhaps because shorter distances result in stronger effects that are easier to detect.
+
+```{r dsitance_tier, warning=FALSE, message=FALSE, fig.width=8, fig.height=3}
+ggplot(mast.sig[mast.sig$class != "TSS",], aes(distance/1e3, logFC_summary, colour=tier)) +
+  geom_point() +
+  scale_x_log10() +
+  scale_color_manual(values = GetColors(n=11, scheme = "sunset")[c(10,8,6)]) +
+  geom_smooth(method="lm") +
+  facet_wrap(~tier) +
+  xlab("DE gene - target distance (kb)") +
+  ylab("log2 fold-change") +
+  th + theme(legend.position = "none")
+```
+
+### Comparison to Gasperini et al.
+
+The `ENH` perturbations profiled are hits from the Gasperini et al. (2009) study conducted in K562 cells. We use the gene linked by Gasperini et al. as the *expected gene*.
+
+From `r length(grep("ENH",targets))` `ENH` targets, `r length(unique(grep("ENH",mast.sig$target, value=TRUE)))` result in at least one DE gene within 1 Mb. From these, we detect the expected gene in 19 cases (`r round(19/26*100, 2)`%), with most being confident E2Gs. Thus, many of these regulatory interactions are active across diverse cell types.
+
+```{r enh_tp}
+enh <- mast.sig[mast.sig$class=="ENH",]
+table(enh[enh$expected,]$tier)
+```
+
+For the seven cases where the expected gene is not detected as DE, 
+
+```{r enh_missed}
+## 'missed' expected genes
+missing <- mast.tgt[mast.tgt$class == "ENH" &
+                      mast.tgt$gene_id == mast.tgt$expected_gene &
+                      mast.tgt$FDR > 0.05,]
+plots <- list()
+for(i in 1:nrow(missing)){
+  target <- missing$target[i]
+  gene <- missing$gene_id[i]
+  pair <- paste(target, gene, sep="|")
+  pvals <- mast[mast$pair_tgt==pair,]$p_value
+  names(pvals) <- mast[mast$pair_tgt==pair,]$gRNA_id
+
+  plots[[i]] <- plot_target_expr(sce = sce,
+                 gene = gene,
+                 guides = gRNA_ann[gRNA_ann$target==target,]$ID, 
+                 target = target,
+                 nt_cells = cells_neg,
+                 per_guide = TRUE, 
+                 fdr_thr = 0.05,
+                 ann = pvals)
+}
+```
+
+- The enhancer associated with regulation of *CD69* expression is a false negative. We observe downregulation with all four gRNAs, but given the small number of cells with each gRNA, the difference is not statistically significant. This hints to detrimental effects from silencing *CD69* expression.
+
+```{r fig.width=4, fig.height=4}
+plots[[which(missing$gene_id=="CD69")]]
+```
+
+- Similarly, the perturbations involving *CERS2* and *CYSTM1* result in lower fraction of perturbed cells with detected expression: *CERS2* expression is detected in 44% of wild-type cells, versus ~30% of perturbed cells; *CYSTM1* expression is detected in 15% of wild-type cells, versus ~8% of perturbed cells. However, these genes are expressed at low levels and thus contain a large number of dropouts, making it challenging to confidently detect small downregulation effects.
+
+```{r fig.width=8, fig.height=4}
+ggarrange(plotlist = plots[which(missing$gene_id %in% c("CERS2", "CYSTM1"))])
+```
+
+- In contrast, perturbations affecting *BTG1* and *TMSB4X*, which are both expressed at high levels, indicate slight gene upregulation in perturbed cells. However, the effect is too small to be detected confidently. These might represent differences in the regulatory wiring in T cells compared to K562 cells.
+
+```{r warning=FALSE, fig.width=8, fig.height=4}
+## remove outliers from TMSB4X plot to be able to see changes more clearly
+p <- plots[[which(missing$gene_id=="TMSB4X")]] + ylim(c(6,10))
+ggarrange(plotlist = list(plots[[which(missing$gene_id=="BTG1")]], p))
+```
+
+- Finally, the perturbations against *PTPRC* and *SOCS3* do not show any robust effects. These might represent enhancers that are not active in T cells or include non-functional gRNAs.
+
+```{r fig.width=8, fig.height=4}
+ggarrange(plotlist = plots[which(missing$gene_id %in% c("PTPRC", "SOCS3"))])
+```
+
+In sum, most perturbations profiled in Gasperini et al. result in the same changes in expression when profiled in T cells.
+
+----
+
+Several of the `ENH` perturbations result in additional confident changes in expression on top of the gene reported in Gasperini et al.
+
+```{r}
+additional <- enh[!enh$expected & enh$tier != "low",]
+additional$tier <- droplevels(additional$tier)
+table(additional$target, additional$tier)
+```
+
+The majority of these additional hits are located hundreds of kilobases away from the perturbation site, and might not be *direct* effects.
+
+```{r fig.width=5, fig.height=3}
+summary(additional$distance)
+
+ggplot(additional, aes(distance/1e3, colour=tier)) +
+  geom_density(size=1) +
+  scale_color_manual(values = GetColors(n=11, scheme = "sunset")[c(10,8)]) +
+  xlab("gene-target distance (kb)") +
+  th
+```
+
+For most cases, the additional hits are farther away than the *expected* gene reported by Gasperini et al. 
+
+```{r warning=FALSE, fig.width=6, fig.height=4}
+matched <- enh[enh$expected,]
+additional$dist_expected <- matched[match(additional$target, matched$target),'distance']
+
+ggplot(additional, aes(dist_expected, distance, colour=tier)) +
+  geom_point() +
+  scale_x_log10(labels = trans_format("log10", math_format(10^.x))) +
+  scale_y_log10(labels = trans_format("log10", math_format(10^.x))) +
+  annotation_logticks() +
+  geom_abline(slope = 1, intercept = 0, lty=2) +
+  scale_color_manual(values = GetColors(n=11, scheme = "sunset")[c(10,8)]) +
+  ggtitle("gene-target distance (bp)") +
+  xlab("expected gene") +
+  ylab("additional hits") +
+  th
+```
+
+And additional hits generally have smaller effects than *expected* hits. Also, many more additional DE genes show upregulation effects, again suggesting these might not be direct effects.
+
+```{r fig.width=6, fig.height=4}
+ggplot(enh[enh$tier != "low",], aes(tier, logFC_summary, colour=expected)) +
+  geom_violin() +
+  geom_boxplot(width=0.1, position = position_dodge(0.9)) +
+  geom_hline(yintercept = 0, lty=2) +
+  scale_color_manual(values = c("grey", "indianred")) +
+  xlab("") + 
+  ylab("log2 fold-change") +
+  th
+```
+
+
+### cCRE perturbations
+
+Beside positive control perturbations, the library also includes 14 targets that overlap ENCODE cCREs: 11 are within gene introns, and 3 are intergenic. 
+
+All but two of the perturbations targeting gene introns result in at least one confident DE gene within 1 Mb, although the majority are `medium` rather than `high` tier.
+
+```{r}
+intron <- mast.sig[mast.sig$class == "INTRON" & mast.sig$tier != "low",]
+intron$tier <- droplevels(intron$tier)
+
+table(intron$target, intron$tier)
+```
+
+From these 9, 5 include the overlapping gene.
+
+```{r}
+intron[intron$gene_id %in% c("ACAP1", "DVL1", "GLB1", "LCAS5L", "LSP1", "SMAD3"), c(1:2,6:9,12,16:17,19)]
+```
+
+The most robust change is observed for *ACAP1*, but the target site is quite close to the gene TSS, and thus we are likely silencing the gene's promoter (making this a `TSS` perturbation rather than intergenic).
+
+```{r fig.width=4, fig.height=4}
+target <- "ACAP1_INTRON"
+gene <- "ACAP1"
+pair <- paste(target, gene, sep="|")
+pvals <- mast[mast$pair_tgt==pair,]$p_value
+names(pvals) <- mast[mast$pair_tgt==pair,]$gRNA_id
+
+plot_target_expr(sce = sce,
+                 gene = gene,
+                 guides = gRNA_ann[gRNA_ann$target==target,]$ID, 
+                 target = target,
+                 nt_cells = cells_neg,
+                 per_guide = TRUE, 
+                 fdr_thr = 0.05,
+                 ann = pvals)
+```
+
+For the introns of *DVL1* and *LSP1* we have several targets, all for the same intron. For these, the `high` confidence hits are generally recapitulated across targets.
+
+```{r}
+tmp <- intron[grep("LSP", intron$target),c(1:2,6:9,12,16:17)]
+tmp[order(tmp$tier,tmp$FDR),]
+```
+
+```{r}
+tmp <- intron[grep("DVL", intron$target),c(1:2,6:9,12,16:17)]
+tmp[order(tmp$tier,tmp$FDR),]
+```
+
+Often the affected genes are hundreds of kilobases away from the target site. 
+
+```{r fig.width=5, fig.height=3}
+summary(intron$distance)
+
+ggplot(intron, aes(distance/1e3, colour=tier)) +
+  geom_density(size=1) +
+  scale_color_manual(values = GetColors(n=11, scheme = "sunset")[c(10,8)]) +
+  xlab("gene-target distance (kb)") +
+  th
+```
+
+For example, downregulation of *ISG15* after `DVL1_INTRON` silencing, is over 300kb away and we observe consistent effects from 7 different gRNAs. But we cannot rule out the effect is due to *DVL1* downregulation, rather than silencing of the regulatory element.
+
+```{r fig.width=8, fig.height=4}
+plots <- list()
+
+target <- "DVL1_INTRON1"
+gene <- "ISG15"
+pair <- paste(target, gene, sep="|")
+pvals <- mast[mast$pair_tgt==pair,]$p_value
+names(pvals) <- mast[mast$pair_tgt==pair,]$gRNA_id
+
+plots[[1]] <- plot_target_expr(sce = sce,
+                 gene = gene,
+                 guides = gRNA_ann[gRNA_ann$target==target,]$ID, 
+                 target = target,
+                 nt_cells = cells_neg,
+                 per_guide = TRUE, 
+                 fdr_thr = 0.05,
+                 ann = pvals)
+
+target <- "DVL1_INTRON2"
+pair <- paste(target, gene, sep="|")
+pvals <- mast[mast$pair_tgt==pair,]$p_value
+names(pvals) <- mast[mast$pair_tgt==pair,]$gRNA_id
+
+plots[[2]] <- plot_target_expr(sce = sce,
+                 gene = gene,
+                 guides = gRNA_ann[gRNA_ann$target==target,]$ID, 
+                 target = target,
+                 nt_cells = cells_neg,
+                 per_guide = TRUE, 
+                 fdr_thr = 0.05,
+                 ann = pvals)
+ggarrange(plotlist = plots)
+```
+
+---
+
+Finally, all 3 intergenic perturbations result in significant changes in expression within 1Mb.
+
+```{r}
+intergenic <- mast.sig[mast.sig$class == "INTERGENIC" & mast.sig$tier != "low",]
+intergenic$tier <- droplevels(intergenic$tier)
+
+table(intergenic$target, intergenic$tier)
+```
+
+DE genes tend to be far away from the perturbation loci, with 75% lying beyond 100kb.
+
+```{r fig.width=5, fig.height=3}
+summary(intergenic$distance)
+
+ggplot(intergenic, aes(distance/1e3, colour=tier)) +
+  geom_density(size=1) +
+  scale_color_manual(values = GetColors(n=11, scheme = "sunset")[c(10,8)]) +
+  xlab("gene-target distance (kb)") +
+  th
+```
+
+Thus, only one of the DE genes is the nearest detected with respect to the targeting site (*BCL9L* for `CXCR5_INTERGENIC`).
+
+```{r}
+intergenic[order(intergenic$target, intergenic$tier, intergenic$FDR),c(1:2,6:9,12,16:17,19,20)]
+```
+
+The strongest effect is observed on *TGFB1* expression, after silencing a locus 25kb away.
+
+```{r fig.width=4, fig.height=4}
+target <- "TGFB1_INTERGENIC"
+gene <- "TGFB1"
+pair <- paste(target, gene, sep="|")
+pvals <- mast[mast$pair_tgt==pair,]$p_value
+names(pvals) <- mast[mast$pair_tgt==pair,]$gRNA_id
+
+plot_target_expr(sce = sce,
+                 gene = gene,
+                 guides = gRNA_ann[gRNA_ann$target==target,]$ID, 
+                 target = target,
+                 nt_cells = cells_neg,
+                 per_guide = TRUE, 
+                 fdr_thr = 0.05,
+                 ann = pvals)
+```
+
+
+```{r save}
+write.table(mast.tgt, paste0(dir, "results/06_DEresults_targetLevel.tsv"), quote = FALSE, sep="\t", row.names = FALSE)
+write.table(mast.sig, paste0(dir, "results/06_DEgenes.tsv"), quote = FALSE, sep="\t", row.names = FALSE)
+write.table(gene_distance_target, paste0(dir, "results/06_gene_target_distance.tsv"), quote = FALSE, sep="\t", row.names = FALSE)
+```
+
+
+```{r info}
+sessionInfo()
+```
+

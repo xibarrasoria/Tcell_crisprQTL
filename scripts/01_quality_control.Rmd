@@ -1,0 +1,365 @@
+---
+title: "<span style='font-size: 16px; color: grey'> crisprQTL proof-of-concept experiment in T cells </span> <br> <span style='font-size: 36px'> Quality control </span>"
+author: "Ximena Ibarra-Soria"
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+output:
+  html_document:
+    theme: paper
+    keep_md: true
+    fig_width: 5
+    fig_height: 5
+    fig_caption: yes
+    df_print: paged
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    toc_float: 
+      collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(DropletUtils)
+library(scater)
+library(scran)
+library(scDblFinder)
+library(BiocParallel)
+library(BiocSingular)
+library(scales)
+library(ggplot2)
+library(ggpubr)
+library(RColorBrewer)
+library(inlmisc)
+
+dir <- paste0(getwd(), "/")
+data.dir <- paste0(dir, "data/")
+
+th <- theme_bw() + theme(
+  axis.text.x = element_text(size=10), 
+  axis.title.x = element_text(size=12), 
+  axis.text.y = element_text(size=12), 
+  axis.title.y = element_text(size=12),
+  panel.grid.major = element_blank(), 
+  panel.grid.minor = element_blank(), 
+  axis.line = element_line(colour = "black"), 
+  panel.border = element_blank(), 
+  plot.title = element_text(face="bold", hjust = 0.5))
+
+## configure parallelisation options
+bpp <- MulticoreParam(38)
+```
+
+This is a proof-of-concept experiment to enable CRISPRi of intergenic elements in primary CD4+ T cells, with a single-cell RNA-seq readout (CROP-seq). To assess the performance of the assay we use a library of positive control gRNAs including:
+
+- 35 gene **transcription start sites** (TSS). For these perturbations, we expect silencing of the targeted genes
+- 3 **locus control regions** (LCR) of CD2. Again, silencing these loci should lead to downregulation of *CD2* expression.
+- 28 **intergenic loci** that have been **linked** to target genes by [Gasperini et al.](https://doi.org/10.1016/j.cell.2018.11.029) We expect decreased expression, but the caveat is that Gasperini et al. performed their screen in K562 cells.
+- 14 additional loci that overlap candidate cis regulatory elements, often located within introns. For these, we do not have a clear expectation of the effects, but are annotated based on the nearest gene.
+
+Each gene/locus is targeted by **four different sgRNAs**. 
+
+We also have **35 non-targeting control sgRNAs** as negative controls.
+
+### Experimental design
+
+Primary CD4+ T cells were run through the experimental protocol to induce CRISPRi with the library detailed above. The perturbed cells were then loaded onto a 10X chromium chip for cell capture and cDNA conversion, using all **8 channels as technical replicates**. The remaining cells were frozen down.
+
+A second 10X run was performed using the frozen cells, running four independent chips to process **32 additional technical replicates** to increase cell numbers. The gRNA library from one sample failed sequencing, and will not be considered further.
+
+### Data pre-processing
+
+Sequencing data was processed using `cellranger v4.0`, with a modified reference genome containing an artificial chromosome composed of all the gRNA sequences used, to capture any gRNA transcripts present in the cDNA library.
+
+All samples showed good mapping statistics and adequate barcode-rank plots. There was one sample from the first experiment with very low cell recovery, likely due to a clog in the 10X channel. This sample will not be included in the data analysis.
+
+We start downstream analyses from `cellranger` filtered count matrices.
+
+### Dataset
+
+Here, we will combine and analyse the data from both experiments; we refer to these two experiments as two different batches. We have ~7K +/- 1.5K cells per sample and 30 samples (technical replicates) in total.
+
+```{r readData, fig.width=7, fig.height=3}
+## read in raw data
+# ignore sample 5 which had a blockage
+# sample 9 failed sequencing and is missing
+dirs <- c(paste0(data.dir, "pilot_CROPseq_CRISPRi_Tcells_batch1/",
+                 "Tcell_CRISPRi_", c(1:4,6:8), "_filtered_feature_bc_matrix"),
+          paste0(data.dir, "data/pilot_CROPseq_CRISPRi_Tcells_batch2/",
+                 "Tcell_CRISPRi_", 10:40, ".filtered_feature_bc_matrix"))
+
+sce <- read10xCounts(samples = dirs, 
+                     sample.names = paste0("Tcell_CRISPRi_", c(1:4,6:8,10:40)),
+                     col.names=TRUE, 
+                     BPPARAM = bpp)
+  
+## separate cDNA counts from gRNA counts
+sce <- splitAltExps(sce, f = rowData(sce)$Type, ref="Gene Expression")
+# rename the alternative experiment
+altExpNames(sce)[altExpNames(sce) == "CRISPR Guide Capture"] <- "CRISPR"
+  
+## also separate gRNA counts captured from the cDNA library
+sce <- splitAltExps(sce, f = grepl("guide", rowData(sce)[,'ID']))
+altExpNames(sce)[2] <- "gRNA_in_cDNA"
+
+## use gene names as row.names instead of Ensembl IDs
+rownames(sce) <- uniquifyFeatureNames(rowData(sce)[,'ID'], rowData(sce)[,'Symbol'])
+
+## plot
+# relevel samples to correctly order them
+sce$Sample = factor(sce$Sample, levels = paste0("Tcell_CRISPRi_", c(1:4, 6:8, 10:40)))
+
+# add batch info
+sce$batch <- ifelse(sce$Sample %in% paste0("Tcell_CRISPRi_", c(1:4,6:8)), "batch1", "batch2")
+# add chip information (groups of 8 samples)
+chip <- paste0("chip", 1:5)
+chip <- c(rep(chip[1:2], each=7), rep(chip[3:5], each=8))
+names(chip) <- unique(sce$Sample)
+sce$chip <- chip[sce$Sample]
+
+# n cells per sample
+df <- as.data.frame(table(sce$Sample))
+df$batch <- ifelse(df$Var1 %in% paste0("Tcell_CRISPRi_", c(1:4,6:8)), "batch1", "batch2")
+df$chip <- chip
+
+ggplot(df, aes(Var1, Freq, fill=chip)) +
+  geom_bar(stat="identity") +
+  scale_fill_manual(values = as.character(GetColors(n=5, scheme = "light"))) +
+  facet_grid(~batch, scales = "free_x", space = "free_x") +
+  xlab("technical replicates") +
+  ylab("number of cells recovered") +
+  th + theme(axis.text.x = element_blank(),
+             axis.ticks.x = element_blank())
+```
+
+
+### Quality control
+
+To remove barcodes associated with poor quality data we check the library size, number of detected genes and fraction of reads from mitochondrial genes in each sample. All three metrics show unimodal distributions and are comparable across batches and chips. 
+
+```{r qc_metrics, fig.width=10, fig.height=7, message=FALSE}
+## compute QC metrics and find outliers
+# define mitochondrial genes
+mito <- grepl("^MT-", rowData(sce)$Symbol)
+# compute metrics
+qc_metrics <- perCellQCMetrics(sce, subsets = list(Mt = mito), BPPARAM = bpp)
+
+# add to sce
+sce$libSize <- log10(qc_metrics$sum)
+sce$n_genes <- log10(qc_metrics$detected)
+sce$mt <- qc_metrics$subsets_Mt_percent
+# also for gRNA features
+sce$libSize_gRNA <- log10(qc_metrics$altexps_CRISPR_sum+1)
+sce$n_gRNAs <- qc_metrics$altexps_CRISPR_detected
+sce$pct_gRNA_total <- qc_metrics$altexps_CRISPR_percent
+    
+## define outliers
+outliers.libSize <- isOutlier(qc_metrics$sum, 
+                              type = "lower", 
+                              log = TRUE, 
+                              nmads = 3,
+                              batch = sce$Sample)
+outliers.ngenes <- isOutlier(qc_metrics$detected, 
+                             type = "lower", 
+                             log = TRUE, 
+                             nmads = 3,
+                             batch = sce$Sample)
+outliers.mt <- isOutlier(qc_metrics$subsets_Mt_percent, 
+                         type = "higher",
+                         log = FALSE,
+                         nmads = 3,
+                         batch = sce$Sample)
+outliers <- outliers.libSize | outliers.ngenes | outliers.mt
+qc_metrics$passQC <- !outliers
+sce$passQC <- !outliers
+
+# and thresholds
+thresholds <- data.frame(libSize = attr(outliers.libSize, "thresholds")[1,],
+                         nGenes = attr(outliers.ngenes, "thresholds")[1,],
+                         mt = attr(outliers.mt, "thresholds")[2,])
+
+## plot
+plots <- list()
+
+# add sample to the qc dataframe
+qc_metrics$sample <- sce$Sample
+qc_metrics <- as.data.frame(qc_metrics)
+
+# add coordinates to plot the thresholds
+thresholds$start <- 1:nrow(thresholds)-0.4
+thresholds$end <- 1:nrow(thresholds)+0.4
+    
+# colour samples by chip
+qc_metrics$colour <- sce$chip
+
+# plot library size
+plots[['libSize']] <- ggplot(qc_metrics, aes(sample, sum)) + 
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                labels = trans_format("log10", math_format(10^.x))) +
+  annotation_logticks(side="l") +
+  geom_violin(aes(colour = colour)) + 
+  geom_boxplot(aes(colour = colour), width=0.05) + 
+  geom_segment(data = thresholds, 
+               aes(x=start, xend=end, y=libSize, yend=libSize),
+               colour="grey20", lwd=0.5, lty=2) +
+  ggtitle("library size") +
+  xlab("") + 
+  ylab(expression('log'[10]*' total UMIs')) + 
+  th +
+  theme(legend.position = "none",
+        axis.text.x = element_blank())
+# plot number of genes
+plots[['nGenes']] <- ggplot(qc_metrics, aes(sample, detected)) + 
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                labels = trans_format("log10", math_format(10^.x))) +
+  annotation_logticks(side="l") +
+  geom_violin(aes(colour = colour)) + 
+  geom_boxplot(aes(colour = colour), width=0.05) + 
+  geom_segment(data = thresholds, 
+               aes(x=start, xend=end, y=nGenes, yend=nGenes),
+               colour="grey20", lwd=0.5, lty=2) +
+  ggtitle("total genes per cell") +
+  xlab("") + 
+  ylab(expression('log'[10]*' genes detected')) +
+  th + 
+  theme(legend.position = "none",
+        axis.text.x = element_blank())
+# plot mitochondrial proportion
+plots[['mt']] <- ggplot(qc_metrics, aes(sample, subsets_Mt_percent)) + 
+  geom_violin(aes(colour = colour)) + 
+  geom_boxplot(aes(colour = colour), width=0.05) + 
+  geom_segment(data = thresholds, 
+               aes(x=start, xend=end, y=mt, yend=mt),
+               colour="grey20", lwd=0.5, lty=2) +
+  ggtitle("% reads in mitochondrial genes") +
+  xlab("") + 
+  ylab(expression('% reads')) +
+  th + 
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggarrange(plotlist = plots, ncol=1, nrow=length(plots), align = "v", heights = c(0.275,0.275,0.4))
+```
+
+Based on these distributions, we define thresholds to determine outliers as any barcodes that deviate by more than 3 median absolute deviations from the median of each sample, as indicated below.
+
+```{r thresholds}
+thresholds$start <- NULL
+thresholds$end <- NULL
+thresholds
+```
+
+Barcodes with library sizes or number of detected genes **lower** than these thresholds, or with **higher** mitochondrial fraction are flagged as low-quality. This corresponds to ~4% of the data.
+
+```{r qc_pass}
+round(prop.table(table(pass_QC = sce$passQC))*100, 2)
+```
+
+Finally, there are a few barcodes that show almost no mitochondrial gene expression. These usually represent stripped nuclei instead of cells.
+
+```{r mt, fig.width=6, fig.height=4}
+plot(density(sce$mt), 
+     xlab = "% reads in mitochondrial genes",
+     main = "", bty="l")
+```
+
+To identify these potential nuclei, we define outliers with very **low** mitochondrial content. Consistent with these representing nuclei, we observe much lower number of genes detected. 
+
+```{r nuclei, fig.width=5, fig.height=3}
+outliers.nuclei <- isOutlier(qc_metrics$subsets_Mt_percent, 
+                               nmads = 3, type = "lower", log = FALSE, 
+                               batch = qc_metrics$sample)
+qc_metrics$nuclei <- outliers.nuclei
+sce$nuclei <- outliers.nuclei
+
+ggplot(qc_metrics, aes(nuclei, detected, colour=nuclei)) +
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  xlab("is nuclei") +
+  ylab("number of genes detected") +
+  th + theme(legend.position = "none")
+```
+
+### Doublet detection
+
+To identify potential doublets we use the `scDblFinder` package, under default settings.
+
+```{r doublets, fig.width=10, fig.height=5}
+set.seed(9378)
+sce <- scDblFinder(sce, samples="Sample", BPPARAM=bpp)
+prop.table(table(sce$Sample, sce$scDblFinder.class), 1)*100
+```
+
+As expected, barcodes labelled as doublets have higher library sizes and many more detected genes.
+
+```{r doublet_stats, fig.width=6, fig.height=3}
+## add to QC stats
+qc_metrics$scDblFinder.class <- sce$scDblFinder.class
+
+## plot libSize and n_genes
+plots <- list()
+plots[[1]] <- ggplot(qc_metrics[qc_metrics$passQC,], aes(scDblFinder.class, log10(sum), colour=scDblFinder.class)) +
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  annotation_logticks(side="l") +
+  xlab("") +
+  ylab("log10 total UMI counts") +
+  ggtitle("library size") +
+  th + theme(legend.position = "none")
+plots[[2]] <- ggplot(qc_metrics[qc_metrics$passQC,], aes(scDblFinder.class, log10(detected), colour=scDblFinder.class)) +
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  annotation_logticks(side="l") +
+  xlab("") +
+  ylab("log10 number of genes") +
+  ggtitle("genes detected") +
+  th + theme(legend.position = "none")
+
+ggarrange(plotlist = plots, ncol=2)
+```
+
+
+### Good-quality data
+
+In summary, we remove barcodes that:
+
+- Have too low library sizes or number of detected genes.
+- Have too high fraction of reads in mitochondrial genes.
+- Have very low fraction of reads in mitochondrial genes, since this is indicative of nuclei.
+- Are likely to be doublets.
+
+We retain around 250K cells for downstream analyses.
+
+```{r good_quality}
+## clean up metadata
+colData(sce) <- colData(sce)[c(1:12,15:16)]
+
+## only keep good-quality cells
+sce <- sce[,sce$passQC]
+## remove nuclei
+sce <- sce[,!sce$nuclei]
+## remove doublets
+sce <- sce[,sce$scDblFinder.class == "singlet"]
+
+## remove non-expressed genes
+sce <- sce[rowMeans(counts(sce))>0,]
+
+ncol(sce)
+```
+
+We save the good-quality data for downstream analyses.
+
+```{r save}
+# save QC metrics
+write.table(qc_metrics, paste0(dir, "results/01_QCmetrics_POC_Tcells.tsv"),
+            quote = FALSE, sep="\t")
+
+# and save raw data after removing low-quality samples
+saveRDS(sce, paste0(dir, "results/01_sce_POC_Tcells.goodQual.RAW.Rds"))
+```
+
+
+
+```{r info}
+sessionInfo()
+```
+

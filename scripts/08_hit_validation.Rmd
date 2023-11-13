@@ -1,0 +1,205 @@
+---
+title: "<span style='font-size: 16px; color: grey'> crisprQTL proof-of-concept experiment in T cells </span> <br> <span style='font-size: 36px'> Hit validation </span>"
+author: "Ximena Ibarra-Soria"
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+output:
+  html_document:
+    theme: paper
+    keep_md: true
+    fig_width: 5
+    fig_height: 5
+    fig_caption: yes
+    df_print: paged
+    code_folding: hide
+    toc: true
+    toc_depth: 4
+    toc_float: 
+      collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(scater)
+library(scran)
+library(edgeR)
+library(scales)
+library(ggplot2)
+library(ggpubr)
+library(RColorBrewer)
+library(inlmisc)
+
+dir <- paste0(getwd(), "/")
+
+th <- theme_bw() + theme(
+  axis.text.x = element_text(size=10), 
+  axis.title.x = element_text(size=12), 
+  axis.text.y = element_text(size=12), 
+  axis.title.y = element_text(size=12),
+  panel.grid.major = element_blank(), 
+  panel.grid.minor = element_blank(), 
+  axis.line = element_line(colour = "black"), 
+  panel.border = element_blank(), 
+  plot.title = element_text(face="bold", hjust = 0.5))
+```
+
+We have identified deferentially expressed genes after silencing intergenic elements in CD4 T cells. To validate the results, new experiments are performed for four different targets:
+
+```{r}
+## bulk RNA-seq validation of selected hits
+files <- list.files(paste0(dir, "data/validation_experiments/Gene"), pattern = "short.txt")
+
+data <- lapply(files, function(x) { read.table(paste0(dir, "data/validation_experiments/Gene/", x),header=1,row.names=1) })
+data <- do.call(cbind, data)
+colnames(data) <- sub(".trimmomatic.genome.deduplicated.gene_id.exon.ct.short.txt", "", files)
+
+# metadata
+meta <- read.table(paste0(dir, "data/validation_experiments/validation_metadata.tsv"), header = TRUE)
+meta <- meta[meta$IRMS_Sample_ID %in% colnames(data),]
+meta <- meta[match(colnames(data), meta$IRMS_Sample_ID),]
+
+meta$target <- as.factor(meta$target)
+meta$target <- relevel(meta$target, ref = "NT")
+levels(meta$target)[-1]
+
+## annotate gene names
+# take from the annotation used by STAR
+# zcat Homo_sapiens.GRCh38.96.gtf.gz | grep -w gene | cut -f 9 | cut -d " " -f2,6 > Homo_sapiens.GRCh38.96.ann
+gene_ann <- read.table(paste0(dir, "data/validation_experiments/Homo_sapiens.GRCh38.96.ann"))[,c(1,3)]
+colnames(gene_ann) <- c("id", "name")
+```
+
+Instead of silencing the elements, this time we use CRISPRn with two gRNAs flanking the putative enhancer to induce a deletion. The perturbed cells are then sequenced in bulk to assess transcriptional changes. Experiments are done using cells from two different donors. Two non-targeting controls are also included to serve as controls.
+
+### Differential expression analysis
+
+We use `edgeR` to test for differences in expression levels between the edited cells and those with NT control gRNAs.
+
+```{r fig.width=10, fig.height=3}
+## edgeR object
+y <- DGEList(data, samples=meta)
+# remove lowly expressed genes
+y <- y[filterByExpr(y, group=y$samples$target),]
+# estimate size factors
+y <- calcNormFactors(y)
+# normalised data
+data.cpm <- cpm(y, log = TRUE)
+
+# design
+design <- model.matrix(~target, y$samples)
+
+# fit model
+y <- estimateDisp(y, design)
+fit <- glmQLFit(y, design, robust = TRUE)
+
+## test each perturbation against NT controls
+# also consider only genes within 1Mb as done in the screen
+gene_gRNA_pairs <- readRDS(paste0(dir, "results/04_gene_gRNA_pairs.Rds"))
+gRNA_ann <- read.table(paste0(dir, "data/gRNA_library.tsv"), sep="\t", header = TRUE)
+gene_gRNA_pairs$target <- gRNA_ann[match(gene_gRNA_pairs$gRNA_id, gRNA_ann$ID),'target']
+gene_gRNA_pairs <- unique(gene_gRNA_pairs[,c(1,3)])
+gene_gRNA_pairs$id <- gene_ann[match(gene_gRNA_pairs$gene_id, gene_ann$name), 'id']
+
+## edgeR object
+y <- DGEList(data, samples=meta)
+# remove lowly expressed genes
+y <- y[filterByExpr(y, group=y$samples$target),]
+# estimate size factors
+y <- calcNormFactors(y)
+# normalised data
+data.cpm <- cpm(y, log = TRUE)
+
+
+edger <- list()
+plots <- list()
+for(target in levels(y$samples$target)[-1]){
+  # subset 
+  y.sub <- y[,y$samples$target %in% c(target, "NT")]
+  y.sub$samples$target <- droplevels(y.sub$samples$target)
+  y.sub$samples$target <- relevel(y.sub$samples$target, ref="NT")
+
+  # design
+  design <- model.matrix(~target, y.sub$samples)
+
+  # fit model
+  y.sub <- estimateDisp(y.sub, design)
+  fit <- glmQLFit(y.sub, design, robust = TRUE)
+
+  edger[[target]] <- as.data.frame(topTags(glmQLFTest(fit), n=Inf))
+  edger[[target]]$target <- target
+
+  # add gene names
+  edger[[target]]$gene <- gene_ann[match(row.names(edger[[target]]), gene_ann$id),'name']
+
+  # flag genes in the +-1Mb neighbourhood
+  genes <- intersect(gene_gRNA_pairs[gene_gRNA_pairs$target == target,]$id, row.names(y$counts))
+  edger[[target]]$cis <- row.names(edger[[target]]) %in% genes
+  
+  # reorder columns and sort
+  edger[[target]] <- edger[[target]][,c(6:8, 1:5)]
+  edger[[target]] <- edger[[target]][order(-edger[[target]]$cis, edger[[target]]$FDR),]
+
+  # volcano plot
+  plots[[target]] <- ggplot(edger[[target]], aes(logFC, -log10(FDR), colour=FDR < 0.05)) +
+    geom_point(size=0.5, alpha=0.5) +
+    scale_color_manual(values = c("grey", "indianred")) +
+    ggtitle(target) +
+    xlab("log fold-change") +
+    ylab("-log10 FDR") +
+    th + labs(colour="DEG") +
+    guides(colour = guide_legend(override.aes = list(size=0.75)))
+}
+ggarrange(plotlist = plots, ncol=4, nrow=1, legend = "none")
+```
+
+### Validation of expected genes
+
+We check whether the gene we identified as DE form the single-cell experiments is recapitulated. Three out of the four perturbations show significant dowregulation of the expected gene.
+
+```{r}
+expected <- rbind(edger[['CTSC_ENH1']][edger[['CTSC_ENH1']]$gene == "CTSC",],
+                  edger[['HPCAL1_ENH']][edger[['HPCAL1_ENH']]$gene == "HPCAL1",],
+                  edger[['KCNN4_ENH']][edger[['KCNN4_ENH']]$gene == "KCNN4",],
+                  edger[['PKM_ENH']][edger[['PKM_ENH']]$gene == "PKM",])
+expected[order(expected$FDR),]
+```
+
+Although `KCNN4_ENH` doesn't reach statistical significance, we do observe the expected downregulation but the variability between donors is larger than the perturbation effect. It is likely that with a larger number of donors this effect would be validated.
+
+```{r fig.width=10, fig.height=3}
+plots <- list()
+for(target in levels(meta$target)[-1]){
+  id <- gene_ann[gene_ann$name == meta[meta$target==target,'expected_gene'],'id']
+  df <- meta[meta$target %in% c(target, "NT"),]
+  df$expr <- as.numeric(data.cpm[id, df$IRMS_Sample_ID])
+
+  plots[[target]] <- ggplot(df, aes(target, expr, colour=donor)) +
+    geom_point() +
+    scale_color_manual(values = as.character(GetColors(n=2, scheme="bright"))) +
+    xlab("") +
+    ylab("log2 CPM") +
+    ggtitle(target) +
+    th
+}
+
+ggarrange(plotlist = plots, ncol=4, nrow=1, common.legend = TRUE, legend = "bottom")
+```
+
+### Conclusions
+
+Based on these results, we can conclude that the effects discovered in the single-cell crisprQTL screen are indeed the result of inactivating the putative enhancers. The changes are reproducible in two independent donors.
+
+```{r}
+## save
+write.table(data.cpm, paste0(dir, "results/08_validation_experiment_CPMexpr.tsv"), quote = FALSE, sep="\t")
+
+saveRDS(edger, paste0(dir, "results/08_validation_experiment_edgeR.Rds"))
+for(target in names(edger)){
+  write.table(edger[[target]], paste0(dir, "results/08_validation_experiment_edgeR_", target, ".tsv"), quote = FALSE, sep="\t")
+}
+```
+
+
+```{r}
+sessionInfo()
+```
+

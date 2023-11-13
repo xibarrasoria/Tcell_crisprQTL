@@ -1,0 +1,224 @@
+---
+title: "<span style='font-size: 16px; color: grey'> crisprQTL proof-of-concept experiment in T cells </span> <br> <span style='font-size: 36px'> Normalisation and batch correction </span>"
+author: "Ximena Ibarra-Soria"
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+output:
+  html_document:
+    theme: paper
+    keep_md: true
+    fig_width: 5
+    fig_height: 5
+    fig_caption: yes
+    df_print: paged
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    toc_float: 
+      collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(scater)
+library(scran)
+library(tricycle)
+library(BiocParallel)
+library(BiocSingular)
+library(harmony)
+library(ggplot2)
+library(ggpubr)
+library(RColorBrewer)
+library(inlmisc)
+library(ComplexHeatmap)
+
+dir <- paste0(getwd(), "/")
+
+th <- theme_bw() + theme(
+  axis.text.x = element_text(size=10), 
+  axis.title.x = element_text(size=12), 
+  axis.text.y = element_text(size=12), 
+  axis.title.y = element_text(size=12),
+  panel.grid.major = element_blank(), 
+  panel.grid.minor = element_blank(), 
+  axis.line = element_line(colour = "black"), 
+  panel.border = element_blank(), 
+  plot.title = element_text(face="bold", hjust = 0.5))
+
+## configure parallelisation options
+bpp <- MulticoreParam(38)
+```
+
+
+We start from the normalised data for ~150K good-quality cells with at least one gRNA detected.
+
+```{r data}
+sce <- readRDS(paste0(dir, "results/02_sce_POC_Tcells.goodQual.calls.Rds"))
+ncol(sce)
+```
+
+### Normalisation
+
+We use `scran` to normalise differences in sequencing depth between cells and other biases.
+
+```{r normalisation, message=FALSE, fig.width=10, fig.height=5}
+# pre-cluster the data to protect the size factor estimation from too many DEGs
+clusters  <- quickCluster(sce, min.size = 100, method = "igraph", BPPARAM = bpp)
+# estimate size factors
+sce <- computeSumFactors(sce, clusters = clusters, min.mean = 0.1, BPPARAM = bpp)
+
+par(mfrow=c(1,2))
+plot(sce$sizeFactor, 10^sce$libSize/1e6, 
+     pch=16, 
+     xlab="size factors", ylab="library size (millions)", 
+     bty="l")
+abline(lm((10^sce$libSize/1e6)~sce$sizeFactor))
+
+## normalise
+sce <- logNormCounts(sce)
+```
+
+
+### Visualisation
+
+To assess the success of normalisation and QC we perform dimensionality reduction using UMAP. We observe some effects from library size, but these are likely correlated with differences in cell cycle phase, instead of failures in the normalisation. 
+
+```{r umap, fig.width=10, fig.height=5}
+## HVGs
+var_decomp <- modelGeneVar(sce, BPPARAM = bpp)
+hvgs <- getTopHVGs(var_decomp, n=2000)
+rowData(sce)$hvg <- row.names(sce) %in% hvgs
+
+## PCA
+set.seed(497)
+sce <- runPCA(sce, subset_row = hvgs, BSPARAM=IrlbaParam())
+
+## UMAP
+sce <- runUMAP(sce, dimred = "PCA", BPPARAM = bpp)
+
+## plot
+umap <- as.data.frame(reducedDim(sce, 'UMAP'))
+colnames(umap) <- c("x", "y")
+umap <- cbind(umap, as.data.frame(colData(sce)))
+
+o <- sample(1:nrow(umap))
+plots <- list()
+plots[[1]] <- ggplot(umap[o,], aes(x, y, colour=libSize)) +
+  geom_point(size=0.2) +
+  scale_color_gradientn(colours = rev(brewer.pal(n=9, "RdYlBu"))) +
+  xlab("UMAP1") + ylab("UMAP2") +
+  ggtitle("library size") +
+  th + theme(axis.text.x = element_blank(),
+             axis.text.y = element_blank(),
+             axis.ticks.x = element_blank(),
+             axis.ticks.y = element_blank(),
+             legend.position = "bottom")
+plots[[2]] <- ggplot(umap[o,], aes(x, y, colour=mt)) +
+  geom_point(size=0.2) +
+  scale_color_gradientn(colours = rev(brewer.pal(n=9, "RdYlBu"))) +
+  xlab("UMAP1") + ylab("UMAP2") +
+  ggtitle("mt") +
+  th + theme(axis.text.x = element_blank(),
+             axis.text.y = element_blank(),
+             axis.ticks.x = element_blank(),
+             axis.ticks.y = element_blank(),
+             legend.position = "bottom")
+
+ggarrange(plotlist = plots, ncol=2, nrow=1, align="hv", legend = "bottom")
+```
+ 
+To confirm this, we use `tricycle` to infer the cell cycle phase of each cell. Indeed, the effects from library size observed on the UMAP correspond to differences of the cells along the cell cycle, with smaller libraries mapping to cells in G1.
+
+```{r tricycle, message=FALSE, warning=FALSE, fig.width=7, fig.height=4}
+## project data to reference
+sce <- project_cycle_space(sce, gname.type = 'SYMBOL', species = 'human')
+
+## estimate cell cycle score
+sce <- estimate_cycle_position(sce)
+
+## plot
+p <- plot_emb_circle_scale(sce, 
+                           dimred = 'UMAP',
+                           point.size = 0.5, point.alpha = 0.9)
+legend <- circle_scale_legend(text.size = 5, alpha = 0.9)
+cowplot::plot_grid(p, legend, ncol = 2, rel_widths = c(1, 0.4))
+```
+
+We do, however, observe strong batch effects from the two different experiments.
+
+```{r batch, fig.width=10, fig.height=5}
+## plot by batch+sample
+plots <- list()
+# batch1
+tmp <- umap[umap$batch == "batch1",]
+o <- sample(1:nrow(tmp))
+plots[[1]] <- ggplot(tmp[o,], aes(x, y, colour=Sample)) +
+  geom_point(size=0.2) +
+  xlab("UMAP1") + ylab("UMAP2") +
+  ggtitle("batch 1") +
+  th + theme(axis.text.x = element_blank(),
+             axis.text.y = element_blank(),
+             axis.ticks.x = element_blank(),
+             axis.ticks.y = element_blank(),
+             legend.position = "none")
+# batch2
+tmp <- umap[umap$batch == "batch2",]
+o <- sample(1:nrow(tmp))
+plots[[2]] <- ggplot(tmp[o,], aes(x, y, colour=Sample)) +
+  geom_point(size=0.2) +
+  xlab("UMAP1") + ylab("UMAP2") +
+  ggtitle("batch 2") +
+  th + theme(axis.text.x = element_blank(),
+             axis.text.y = element_blank(),
+             axis.ticks.x = element_blank(),
+             axis.ticks.y = element_blank(),
+             legend.position = "none")
+
+ggarrange(plotlist = plots, ncol=2, nrow=1, align="hv")
+```
+
+### Batch correction
+
+We perform batch correction using `harmony` to account for the differences between the two batches. We recompute the UMAP and observe successful batch correction. 
+
+```{r harmony, warning=FALSE, message=FALSE}
+## remove batch effect from the two experiments
+harmony_embeddings <- HarmonyMatrix(data_mat = reducedDim(sce, 'PCA'),
+                                    meta_data = sce$batch,
+                                    do_pca = FALSE,
+                                    plot_convergence = FALSE,
+                                    verbose = FALSE) # 11.6 min
+## add to sce and recompute UMAP
+reducedDim(sce, 'harmony') <- harmony_embeddings
+sce <- runUMAP(sce, dimred = "harmony", name = 'UMAP', BPPARAM = bpp) # 13min
+
+## get data
+umap <- as.data.frame(reducedDim(sce, 'UMAP'))
+colnames(umap) <- c("x", "y")
+umap <- cbind(umap, as.data.frame(colData(sce)))
+
+## plot
+o <- sample(1:nrow(umap))
+ggplot(umap[o,], aes(x, y, colour=batch)) +
+  geom_point(size=0.2) +
+  xlab("UMAP1") + ylab("UMAP2") +
+  th + theme(axis.text.x = element_blank(),
+             axis.text.y = element_blank(),
+             axis.ticks.x = element_blank(),
+             axis.ticks.y = element_blank()) +
+  guides(colour = guide_legend(override.aes = list(size=1)))
+```
+
+We now have normalised data and a batch-corrected embedding for visualisation in downstream analyses. We will have to account for the differences in batches in all the perturbation analyses.
+
+```{r save}
+## save
+saveRDS(sce, paste0(dir, "results/03_sce_POC_Tcells.goodQual.calls.NORM.Rds"))
+```
+
+
+
+
+```{r info}
+sessionInfo()
+```
+

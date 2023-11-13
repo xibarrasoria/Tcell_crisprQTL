@@ -1,0 +1,309 @@
+---
+title: "<span style='font-size: 16px; color: grey'> crisprQTL proof-of-concept experiment in T cells </span> <br> <span style='font-size: 36px'> Visualisation of perturbation effects </span>"
+author: "Ximena Ibarra-Soria"
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+output:
+  html_document:
+    theme: paper
+    keep_md: true
+    fig_width: 5
+    fig_height: 5
+    fig_caption: yes
+    df_print: paged
+    code_folding: hide
+    toc: true
+    toc_depth: 4
+    toc_float: 
+      collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(scran)
+library(scales)
+library(ggplot2)
+library(ggpubr)
+
+dir <- paste0(getwd(), "/")
+
+th <- theme_bw() + theme(
+  axis.text.x = element_text(size=10), 
+  axis.title.x = element_text(size=12), 
+  axis.text.y = element_text(size=12), 
+  axis.title.y = element_text(size=12),
+  panel.grid.major = element_blank(), 
+  panel.grid.minor = element_blank(), 
+  axis.line = element_line(colour = "black"), 
+  panel.border = element_blank(), 
+  plot.title = element_text(face="bold", hjust = 0.5))
+
+## FUNCTIONS
+
+plot_gene_sc <- function(sce=NULL, cells.neg=NULL, hit=NULL, thr=0.05){
+  ## get relevant data
+  gene <- hit$gene_id
+  target <- hit$target
+  guides <- unlist(strsplit(hit$gRNAs, ",", fixed=TRUE))
+  pvals <- as.numeric(unlist(strsplit(hit$p_values, ",", fixed=TRUE)))
+  names(pvals) <- guides
+  fcs <- as.numeric(unlist(strsplit(hit$logFCs, ",", fixed=TRUE)))
+  names(fcs) <- guides
+  
+  ## get cells with gRNAs in `guides`
+  cells.guides <- sapply(guides, function(x) names(which(counts(altExp(sce, 'gRNA_calls'))[x,])), simplify = FALSE)
+  cells.pos <- rep(guides, times=unlist(lapply(cells.guides, length)))
+  names(cells.pos) <- unname(do.call(c, cells.guides))
+  
+  ## retrieve expression of `gene`
+  df <- data.frame(cell = union(names(cells.pos), cells.neg))
+  df$expr <- logcounts(sce[,df$cell])[gene,]
+  # label perturbed vs background
+  df$status = factor(ifelse(df$cell %in% names(cells.pos), "perturbed", "background"), levels=c("perturbed", "background"))
+  # annotate each gRNA
+  df <- cbind(df, sapply(unique(cells.pos), function(x) df$cell %in% names(cells.pos[cells.pos==x])))
+  # remove cells with several on-target gRNAs (to keep plots consistent and avoid having some with more violins than others)
+  if(ncol(df)>4){
+    df$guide <- ifelse(rowSums(df[,-c(1:3)])>1 , "multiple",
+                       ifelse(rowSums(df[,-c(1:3)])==0, "background", "guide"))
+    df <- df[df$guide != "multiple",]
+    for(g in unique(cells.pos)){
+      df[df[,g]==TRUE & df$guide == "guide",]$guide <- g
+    }
+    df$guide <- factor(df$guide, levels=c(unique(cells.pos), "background"))
+  }else{
+    df$guide <- ifelse(df[,4]==TRUE, colnames(df)[4], "background")
+    df$guide <- factor(df$guide, levels=c(colnames(df)[4], "background"))
+  }
+  
+  ## colour based on significance per-guide
+  df$colour <- ifelse(df$status == "background", "background", "perturbed")
+  
+  ## plot
+  p <- ggplot(df, aes(guide, expr, colour = colour)) +
+    geom_violin(lwd=1) +
+    geom_jitter(stat="identity",
+                position=position_jitter(0.1), 
+                size=1, alpha=0.2) +
+    scale_color_manual(values = c(perturbed="lightcoral", background="grey60")) +
+    geom_boxplot(outlier.shape = NA, colour="grey20", width=0.1, fill=NA) +
+    geom_hline(yintercept = median(df[df$status=="background",]$expr), colour="grey20", lty=2) +
+    xlab("") + 
+    ylab(expression('log'[2]*' normalised counts')) +
+    ggtitle(label = hit$pair_tgt, 
+            subtitle = paste("FDR:", formatC(hit$FDR, format = "e", digits = 3), 
+                             "\t\ttier:", toupper(hit$tier), "\t\tdistance:", round(hit$distance/1e3, 1), "kb\n")) +
+    th + theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5),
+               legend.position = "none")
+
+  ## annotate
+  p <- p + annotate("text", 
+                    x = 1:length(levels(df$guide)),
+                    y = max(df$expr)+((max(df$expr)-min(df$expr))*0.3), 
+                    label = paste0(
+                      c(formatC(pvals[setdiff(levels(df$guide),"background")], format = "e", digits = 2), ""), "\n",
+                      c(round(fcs[setdiff(levels(df$guide),"background")], 2), ""), "\n",
+                      paste0("(", as.numeric(round(prop.table(table(df$guide, df$expr>0),1)*100,1)[,'TRUE']), ")"), "\n",
+                      as.numeric(c(table(cells.pos)[setdiff(levels(df$guide),"background")], 5e3))),
+                    size = 3, 
+                    colour = c(ifelse(pvals[setdiff(levels(df$guide),"background")] < thr, "lightcoral", "grey40"), "grey40")) +
+        coord_cartesian(clip = "off")
+
+  return(p)
+}
+
+```
+
+We have determined the set of genes that change expression upon perturbation of each target locus. Here, we plot the expression changes for all significant results.
+
+```{r data}
+## data
+sce <- readRDS(paste0(dir, "results/03_sce_POC_Tcells.goodQual.calls.NORM.Rds"))
+
+## gRNA annotation
+gRNA_ann <- read.table(paste0(dir, "data/gRNA_library.tsv"), sep="\t", header = TRUE)
+
+## DEGs
+degs <- read.table(paste0(dir, "results/06_DEgenes.tsv"), header = TRUE)
+# all DE testing results
+res <- read.table(paste0(dir, "results/06_DEresults_targetLevel.tsv"), header = TRUE)
+res$tier <- degs[match(res$pair_tgt, degs$pair_tgt),'tier']
+res$distance <- degs[match(res$pair_tgt, degs$pair_tgt),'distance']
+
+# define NT cells for plotting
+nt_guides <- gRNA_ann[gRNA_ann$class=="NT",]$ID
+cells <- colnames(sce[,sce$call == "unique"])
+cells.neg <- apply(counts(altExp(sce, 'gRNA_calls'))[nt_guides, cells], 1, function(x) names(which(x)))
+cells.neg <- unlist(cells.neg)
+# use 5K
+set.seed(749)
+cells.neg <- sample(cells.neg, size=5e3)
+```
+
+
+### True positive effects {.tabset}
+
+First, we plot the expression of the genes that are expected to be downregulated, from positive control perturbations.
+
+#### TSS
+
+```{r TP_tss, message=FALSE, warning=FALSE, fig.width=10, fig.height=68}
+selected <- setdiff(unique(gRNA_ann[gRNA_ann$class=="TSS",]$target), c("IL12A_TSS", "TBX1_TSS")) # IL12A and TBX1 are not expressed
+
+## plot every target
+plots <- list()
+for(target in selected){
+  # expected gene
+  gene <- unique(gRNA_ann[gRNA_ann$target==target,]$expected_DE_gene)
+
+  # DE results
+  hit <- res[res$target==target & res$gene_id==gene,]
+
+  # plot
+  plots[[target]] <- plot_gene_sc(sce = sce, cells.neg = cells.neg, hit = hit, thr=0.05)
+}
+ggarrange(plotlist = plots, ncol=2, nrow=17, align="hv")
+```
+
+
+#### LCR
+
+```{r TP_LCR, message=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+selected <- unique(gRNA_ann[gRNA_ann$class=="LCR",]$target)
+
+## plot every target
+plots <- list()
+for(target in selected){
+  # expected gene
+  gene <- unique(gRNA_ann[gRNA_ann$target==target,]$expected_DE_gene)
+  
+  # DE results
+  hit <- res[res$target==target & res$gene_id==gene,]
+    
+  # plot
+  plots[[target]] <- plot_gene_sc(sce = sce, cells.neg = cells.neg, hit = hit, thr=0.05)
+}
+ggarrange(plotlist = plots, ncol=2, nrow=2, align="hv")
+```
+
+
+#### ENH
+
+```{r TP_enh, message=FALSE, warning=FALSE, fig.width=10, fig.height=52}
+selected <- setdiff(unique(gRNA_ann[gRNA_ann$class=="ENH",]$target), c("USP6NL_ENH", "TUBB2A_ENH")) # USP6NL and TUBB2A are not expressed
+
+## plot every target
+plots <- list()
+for(target in selected){
+  # expected gene
+  gene <- unique(gRNA_ann[gRNA_ann$target==target,]$expected_DE_gene)
+
+  # DE results
+  hit <- res[res$target==target & res$gene_id==gene,]
+    
+  # plot
+  plots[[target]] <- plot_gene_sc(sce = sce, cells.neg = cells.neg, hit = hit, thr=0.05)
+}
+ggarrange(plotlist = plots, ncol=2, nrow=13, align="hv")
+```
+
+
+
+### Additional hits {.tabset}
+
+Below are any other **high- and medium-confidence hits**, that are not the expected gene for intergenic perturbations.
+
+#### ENH
+
+```{r other_enh, message=FALSE, warning=FALSE, fig.width=10, fig.height=84}
+## plot every target
+selected <- degs[degs$class=="ENH" & !degs$expected & degs$tier!="low",]
+
+plots <- list()
+for(i in 1:nrow(selected)){
+  hit <- selected[i,]
+
+  plots[[i]] <- plot_gene_sc(sce = sce, cells.neg = cells.neg, hit = hit, thr=0.05)
+}
+ggarrange(plotlist = plots, ncol=2, nrow=21, align="hv")
+```
+
+
+#### INTRON
+
+```{r other_intron, message=FALSE, warning=FALSE, fig.width=10, fig.height=48}
+## plot every target
+selected <- degs[degs$class=="INTRON" & degs$tier!="low",]
+
+plots <- list()
+for(i in 1:nrow(selected)){
+  hit <- selected[i,]
+
+  plots[[i]] <- plot_gene_sc(sce = sce, cells.neg = cells.neg, hit = hit, thr=0.05)
+}
+ggarrange(plotlist = plots, ncol=2, nrow=12, align="hv")
+```
+
+#### INTERGENIC
+
+```{r other_intergenic, message=FALSE, warning=FALSE, fig.width=10, fig.height=24}
+## plot every target
+selected <- degs[degs$class=="INTERGENIC" & degs$tier!="low",]
+
+plots <- list()
+for(i in 1:nrow(selected)){
+  hit <- selected[i,]
+
+  plots[[i]] <- plot_gene_sc(sce = sce, cells.neg = cells.neg, hit = hit, thr=0.05)
+}
+ggarrange(plotlist = plots, ncol=2, nrow=6, align="hv")
+```
+
+### Overlapping gene for intronic perturbations
+
+For intronic elements, we check directly the expression of the overlapping gene. *LCA5L* is not detected in at least 5% of cells and was not tested.
+
+```{r intron_gene, message=FALSE, warning=FALSE, fig.width=10, fig.height=20}
+## plot every target
+df <- data.frame(target = unique(gRNA_ann[gRNA_ann$class=="INTRON",]$target),
+                 gene = unlist(lapply(strsplit(unique(gRNA_ann[gRNA_ann$class=="INTRON",]$target), "_"),'[[',1)))
+df <- df[-which(df$target == "LCA5L_INTRON"),]
+
+plots <- list()
+for(i in 1:nrow(df)){
+  target <- df[i,1]
+  gene <- df[i,2]
+  hit <- res[res$target == target & res$gene_id == gene,]
+  
+  plots[[i]] <- plot_gene_sc(sce = sce, cells.neg = cells.neg, hit = hit, thr=0.05)
+}
+ggarrange(plotlist = plots, ncol=2, nrow=5, align="hv")
+```
+
+
+### Nearby genes for intergenic perturbations
+
+We also plot the expression of the four closest genes (detected in at least 5% of the cells) for `INTERGENIC` targets.
+
+```{r intergenic_nearby, message=FALSE, warning=FALSE, fig.width=10, fig.height=24}
+## neighbourhood
+gene_distance_target <- read.table(paste0(dir, "results/06_gene_target_distance.tsv"), header=TRUE)
+
+## plot every target
+df <- gene_distance_target[grep("INTERGENIC", gene_distance_target$target),]
+
+plots <- list()
+for(target in unique(gRNA_ann[gRNA_ann$class=="INTERGENIC",]$target)){
+  selected <- df[which(df$target==target & df$expressed),][1:4,]
+  for(i in 1:nrow(selected)){
+    hit <- res[res$target == target & res$gene_id == selected[i,'external_gene_name'],]
+    plots[[paste0(target,i)]] <- plot_gene_sc(sce = sce, cells.neg = cells.neg, hit = hit, thr=0.05)
+  }
+}
+ggarrange(plotlist = plots, ncol=2, nrow=6, align="hv")
+```
+
+
+```{r info}
+sessionInfo()
+```
+
