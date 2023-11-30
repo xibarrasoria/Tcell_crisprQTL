@@ -2882,7 +2882,7 @@ div.tocify {
 
 <h1 class="title toc-ignore"><span style="font-size: 16px; color: grey"> crisprQTL proof-of-concept experiment in T cells </span> <br> <span style="font-size: 36px"> Hit validation </span></h1>
 <h4 class="author">Ximena Ibarra-Soria</h4>
-<h4 class="date">10 November, 2023</h4>
+<h4 class="date">30 November, 2023</h4>
 
 </div>
 
@@ -2913,23 +2913,7 @@ colnames(gene_ann) &lt;- c(&quot;id&quot;, &quot;name&quot;)</code></pre>
 <div id="differential-expression-analysis" class="section level3">
 <h3>Differential expression analysis</h3>
 <p>We use <code>edgeR</code> to test for differences in expression levels between the edited cells and those with NT control gRNAs.</p>
-<pre class="r"><code>## edgeR object
-y &lt;- DGEList(data, samples=meta)
-# remove lowly expressed genes
-y &lt;- y[filterByExpr(y, group=y$samples$target),]
-# estimate size factors
-y &lt;- calcNormFactors(y)
-# normalised data
-data.cpm &lt;- cpm(y, log = TRUE)
-
-# design
-design &lt;- model.matrix(~target, y$samples)
-
-# fit model
-y &lt;- estimateDisp(y, design)
-fit &lt;- glmQLFit(y, design, robust = TRUE)
-
-## test each perturbation against NT controls
+<pre class="r"><code>## test each perturbation against NT controls
 # also consider only genes within 1Mb as done in the screen
 gene_gRNA_pairs &lt;- readRDS(paste0(dir, &quot;results/04_gene_gRNA_pairs.Rds&quot;))
 gRNA_ann &lt;- read.table(paste0(dir, &quot;data/gRNA_library.tsv&quot;), sep=&quot;\t&quot;, header = TRUE)

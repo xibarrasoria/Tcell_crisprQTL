@@ -28,7 +28,7 @@ library(ggpubr)
 library(RColorBrewer)
 library(inlmisc)
 
-dir <- paste0(getwd(), "/")
+dir <- "/hpc/projects/upt/FxG_CB/users/xi629080/2023/crisprQTL_manuscript_2022/"
 
 th <- theme_bw() + theme(
   axis.text.x = element_text(size=10), 
@@ -75,22 +75,6 @@ Instead of silencing the elements, this time we use CRISPRn with two gRNAs flank
 We use `edgeR` to test for differences in expression levels between the edited cells and those with NT control gRNAs.
 
 ```{r fig.width=10, fig.height=3}
-## edgeR object
-y <- DGEList(data, samples=meta)
-# remove lowly expressed genes
-y <- y[filterByExpr(y, group=y$samples$target),]
-# estimate size factors
-y <- calcNormFactors(y)
-# normalised data
-data.cpm <- cpm(y, log = TRUE)
-
-# design
-design <- model.matrix(~target, y$samples)
-
-# fit model
-y <- estimateDisp(y, design)
-fit <- glmQLFit(y, design, robust = TRUE)
-
 ## test each perturbation against NT controls
 # also consider only genes within 1Mb as done in the screen
 gene_gRNA_pairs <- readRDS(paste0(dir, "results/04_gene_gRNA_pairs.Rds"))

@@ -1,7 +1,7 @@
 ---
 title: "<span style='font-size: 16px; color: grey'> crisprQTL proof-of-concept experiment in T cells </span> <br> <span style='font-size: 36px'> Hit validation </span>"
 author: "Ximena Ibarra-Soria"
-date: '10 November, 2023'
+date: '30 November, 2023'
 output:
   html_document:
     theme: paper
@@ -60,22 +60,6 @@ We use `edgeR` to test for differences in expression levels between the edited c
 
 
 ```r
-## edgeR object
-y <- DGEList(data, samples=meta)
-# remove lowly expressed genes
-y <- y[filterByExpr(y, group=y$samples$target),]
-# estimate size factors
-y <- calcNormFactors(y)
-# normalised data
-data.cpm <- cpm(y, log = TRUE)
-
-# design
-design <- model.matrix(~target, y$samples)
-
-# fit model
-y <- estimateDisp(y, design)
-fit <- glmQLFit(y, design, robust = TRUE)
-
 ## test each perturbation against NT controls
 # also consider only genes within 1Mb as done in the screen
 gene_gRNA_pairs <- readRDS(paste0(dir, "results/04_gene_gRNA_pairs.Rds"))
